@@ -1,0 +1,543 @@
+configfile: "config/config.yaml"
+
+import os
+
+
+CHROMS = [str(chrom) for chrom in config["chromosomes"]]
+SCORE_DIR = config["score_dir"]
+SCORE_NAME = config["score_name"]
+PHEWAS_CONFIG = config["phewas"]
+
+
+def cfg_path(key):
+    value = config[key]
+    if isinstance(value, str):
+        return os.path.expandvars(value)
+    return value
+
+
+def genotype_source_prefix(wildcards):
+    return config["genotype_prefix_template"].format(chrom=wildcards.chrom)
+
+
+def genotype_pfile_prefix(wildcards):
+    source_prefix = genotype_source_prefix(wildcards)
+    return os.path.join(os.path.expandvars(config["genotype_mount_prefix"]), source_prefix)
+
+
+def genotype_file(wildcards, suffix):
+    return f"{genotype_pfile_prefix(wildcards)}.{suffix}"
+
+
+rule all:
+    input:
+        cfg_path("final_score"),
+        os.path.expandvars(PHEWAS_CONFIG["output"]),
+        os.path.expandvars(PHEWAS_CONFIG["spline_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["survival_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["landmark_survival_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["tail_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["age_interaction_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["supplementary_logistic_covariate_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["supplementary_min_code_count2_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["supplementary_survival_sensitivity_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["supplementary_decile_risk_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["second_wave_ehr_utilization_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["second_wave_sex_stratified_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["second_wave_prs_outlier_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["second_wave_decile_ci_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["second_wave_prior_cancer_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["somatic_burden_logistic_output"]),
+        os.path.expandvars(PHEWAS_CONFIG["somatic_burden_post_draw_survival_output"]),
+        expand(f"{SCORE_DIR}/chr{{chrom}}/{SCORE_NAME}.chr{{chrom}}.sscore.vars", chrom=CHROMS),
+
+
+rule split_weights_by_chr:
+    input:
+        cfg_path("weights")
+    output:
+        expand("resources/weights/chr{chrom}.score.tsv", chrom=CHROMS)
+    log:
+        "logs/split_weights.log"
+    params:
+        chromosomes=" ".join(CHROMS)
+    shell:
+        """
+        python workflow/scripts/split_weights_by_chr.py \
+          --weights {input} \
+          --out-dir resources/weights \
+          --chromosomes {params.chromosomes} \
+          > {log} 2>&1
+        """
+
+
+rule eur_keep_file:
+    input:
+        cfg_path("covariates")
+    output:
+        cfg_path("keep_file")
+    params:
+        ancestry=config.get("ancestry_label", "eur")
+    log:
+        "logs/eur_keep_file.log"
+    shell:
+        """
+        python workflow/scripts/make_keep_file.py \
+          --covariates {input} \
+          --out {output} \
+          --ancestry {params.ancestry} \
+          > {log} 2>&1
+        """
+
+
+rule score_chromosome:
+    input:
+        pgen=lambda wildcards: genotype_file(wildcards, "pgen"),
+        pvar=lambda wildcards: genotype_file(wildcards, "pvar"),
+        psam=lambda wildcards: genotype_file(wildcards, "psam"),
+        weights="resources/weights/chr{chrom}.score.tsv",
+        keep=cfg_path("keep_file"),
+    output:
+        sscore=f"{SCORE_DIR}/chr{{chrom}}/{SCORE_NAME}.chr{{chrom}}.sscore",
+        vars=f"{SCORE_DIR}/chr{{chrom}}/{SCORE_NAME}.chr{{chrom}}.sscore.vars",
+    params:
+        out_prefix=lambda wildcards: f"{SCORE_DIR}/chr{wildcards.chrom}/{SCORE_NAME}.chr{wildcards.chrom}",
+        pfile=genotype_pfile_prefix,
+        plink2=lambda wildcards: cfg_path("plink2"),
+        biallelic_flag=lambda wildcards: "--max-alleles 2" if config.get("biallelic_only", True) else "",
+    threads:
+        int(config.get("threads_per_chromosome", 1))
+    log:
+        "logs/score_chr{chrom}.log"
+    shell:
+        """
+        mkdir -p {SCORE_DIR}/chr{wildcards.chrom}
+        {params.plink2} \
+          --pfile {params.pfile} \
+          --keep {input.keep} \
+          {params.biallelic_flag} \
+          --set-all-var-ids 'chr@:#:$r:$a' \
+          --new-id-max-allele-len 2000 \
+          --score {input.weights} 1 2 3 no-mean-imputation list-variants cols=maybefid,nallele,denom,dosagesum,scoresums \
+          --threads {threads} \
+          --out {params.out_prefix} \
+          > {log} 2>&1
+        """
+
+
+rule combine_chromosome_scores:
+    input:
+        expand(f"{SCORE_DIR}/chr{{chrom}}/{SCORE_NAME}.chr{{chrom}}.sscore", chrom=CHROMS)
+    output:
+        cfg_path("final_score")
+    log:
+        "logs/combine_scores.log"
+    shell:
+        """
+        python workflow/scripts/combine_scores.py \
+          --score-name {SCORE_NAME} \
+          --out {output} \
+          {input} \
+          > {log} 2>&1
+        """
+
+
+rule build_phecode_resources:
+    output:
+        expanded=os.path.expandvars(PHEWAS_CONFIG["phecode_map_expanded"]),
+        info=os.path.expandvars(PHEWAS_CONFIG["phecode_info"]),
+    log:
+        "logs/build_phecode_resources.log"
+    shell:
+        """
+        Rscript workflow/scripts/build_phecode_resources.R \
+          {output.expanded} \
+          {output.info} \
+          > {log} 2>&1
+        """
+
+
+rule prepare_target_phecode_map:
+    input:
+        targets=os.path.expandvars(PHEWAS_CONFIG["targets"]),
+        expanded=os.path.expandvars(PHEWAS_CONFIG["phecode_map_expanded"]),
+    output:
+        os.path.expandvars(PHEWAS_CONFIG["target_icd_map"])
+    log:
+        "logs/prepare_target_phecode_map.log"
+    shell:
+        """
+        python workflow/scripts/prepare_target_phecode_map.py \
+          --targets {input.targets} \
+          --expanded-map {input.expanded} \
+          --out {output} \
+          > {log} 2>&1
+        """
+
+
+rule query_aou_target_icd_evidence:
+    input:
+        target_map=os.path.expandvars(PHEWAS_CONFIG["target_icd_map"]),
+    output:
+        os.path.expandvars(PHEWAS_CONFIG["icd_evidence"])
+    log:
+        "logs/query_aou_target_icd_evidence.log"
+    shell:
+        """
+        python workflow/scripts/query_aou_icd_evidence.py \
+          --target-map {input.target_map} \
+          --out {output} \
+          > {log} 2>&1
+        """
+
+
+rule query_aou_ehr_denominator:
+    output:
+        os.path.expandvars(PHEWAS_CONFIG["ehr_denominator"])
+    log:
+        "logs/query_aou_ehr_denominator.log"
+    shell:
+        """
+        python workflow/scripts/query_aou_ehr_denominator.py \
+          --out {output} \
+          > {log} 2>&1
+        """
+
+
+rule query_aou_survival_base:
+    output:
+        os.path.expandvars(PHEWAS_CONFIG["survival_base"])
+    log:
+        "logs/query_aou_survival_base.log"
+    shell:
+        """
+        python workflow/scripts/query_aou_survival_base.py \
+          --out {output} \
+          > {log} 2>&1
+        """
+
+
+rule build_phewas_phenotypes:
+    input:
+        targets=os.path.expandvars(PHEWAS_CONFIG["targets"]),
+        target_map=os.path.expandvars(PHEWAS_CONFIG["target_icd_map"]),
+        evidence=os.path.expandvars(PHEWAS_CONFIG["icd_evidence"]),
+        denominator=os.path.expandvars(PHEWAS_CONFIG["ehr_denominator"]),
+        scores=cfg_path("final_score"),
+        covariates=cfg_path("covariates"),
+    output:
+        phenotypes=os.path.expandvars(PHEWAS_CONFIG["phenotypes"]),
+        summary=os.path.expandvars(PHEWAS_CONFIG["phenotype_summary"]),
+    params:
+        min_code_count=PHEWAS_CONFIG.get("min_code_count", 2),
+        force_include_flag="--force-include-all" if PHEWAS_CONFIG.get("force_include_all_targets", False) else "",
+    log:
+        "logs/build_phewas_phenotypes.log"
+    shell:
+        """
+        python workflow/scripts/build_phewas_phenotypes.py \
+          --targets {input.targets} \
+          --target-map {input.target_map} \
+          --evidence {input.evidence} \
+          --denominator {input.denominator} \
+          --scores {input.scores} \
+          --covariates {input.covariates} \
+          --min-code-count {params.min_code_count} \
+          {params.force_include_flag} \
+          --phenotypes-out {output.phenotypes} \
+          --summary-out {output.summary} \
+          > {log} 2>&1
+        """
+
+
+rule phewas:
+    input:
+        score=cfg_path("final_score"),
+        phenotypes=os.path.expandvars(PHEWAS_CONFIG["phenotypes"]),
+        summary=os.path.expandvars(PHEWAS_CONFIG["phenotype_summary"]),
+        covariates=cfg_path("covariates"),
+    output:
+        os.path.expandvars(PHEWAS_CONFIG["output"])
+    params:
+        prs_col=PHEWAS_CONFIG.get("prs_col", "PRSFNN_out_final_Z"),
+        age_cols=",".join(PHEWAS_CONFIG["age_cols"]),
+        pc_cols=",".join(PHEWAS_CONFIG["pc_cols"]),
+    log:
+        "logs/phewas.log"
+    shell:
+        """
+        python workflow/scripts/run_targeted_phewas.py \
+          --scores {input.score} \
+          --phenotypes {input.phenotypes} \
+          --phenotype-summary {input.summary} \
+          --covariates {input.covariates} \
+          --prs-col {params.prs_col} \
+          --age-cols {params.age_cols} \
+          --pc-cols {params.pc_cols} \
+          --out {output} \
+          > {log} 2>&1
+        """
+
+
+rule phewas_prs_spline:
+    input:
+        score=cfg_path("final_score"),
+        phenotypes=os.path.expandvars(PHEWAS_CONFIG["phenotypes"]),
+        summary=os.path.expandvars(PHEWAS_CONFIG["phenotype_summary"]),
+        covariates=cfg_path("covariates"),
+    output:
+        os.path.expandvars(PHEWAS_CONFIG["spline_output"])
+    params:
+        prs_col=PHEWAS_CONFIG.get("prs_col", "PRSFNN_out_final_Z"),
+        age_cols=",".join(PHEWAS_CONFIG["age_cols"]),
+        pc_cols=",".join(PHEWAS_CONFIG["pc_cols"]),
+        spline_df=PHEWAS_CONFIG.get("prs_spline_df", 4),
+    log:
+        "logs/phewas_prs_spline.log"
+    shell:
+        """
+        python workflow/scripts/run_prs_spline_phewas.py \
+          --scores {input.score} \
+          --phenotypes {input.phenotypes} \
+          --phenotype-summary {input.summary} \
+          --covariates {input.covariates} \
+          --prs-col {params.prs_col} \
+          --age-cols {params.age_cols} \
+          --pc-cols {params.pc_cols} \
+          --spline-df {params.spline_df} \
+          --out {output} \
+          > {log} 2>&1
+        """
+
+
+rule survival_phewas:
+    input:
+        score=cfg_path("final_score"),
+        target_map=os.path.expandvars(PHEWAS_CONFIG["target_icd_map"]),
+        evidence=os.path.expandvars(PHEWAS_CONFIG["icd_evidence"]),
+        summary=os.path.expandvars(PHEWAS_CONFIG["phenotype_summary"]),
+        survival_base=os.path.expandvars(PHEWAS_CONFIG["survival_base"]),
+        covariates=cfg_path("covariates"),
+    output:
+        os.path.expandvars(PHEWAS_CONFIG["survival_output"])
+    params:
+        prs_col=PHEWAS_CONFIG.get("prs_col", "PRSFNN_out_final_Z"),
+        min_code_count=PHEWAS_CONFIG.get("min_code_count", 1),
+        pc_cols=",".join(PHEWAS_CONFIG["pc_cols"]),
+    log:
+        "logs/survival_phewas.log"
+    shell:
+        """
+        python workflow/scripts/run_survival_phewas.py \
+          --scores {input.score} \
+          --target-map {input.target_map} \
+          --evidence {input.evidence} \
+          --phenotype-summary {input.summary} \
+          --survival-base {input.survival_base} \
+          --covariates {input.covariates} \
+          --prs-col {params.prs_col} \
+          --pc-cols {params.pc_cols} \
+          --min-code-count {params.min_code_count} \
+          --out {output} \
+          > {log} 2>&1
+        """
+
+
+rule landmark_survival_phewas:
+    input:
+        score=cfg_path("final_score"),
+        target_map=os.path.expandvars(PHEWAS_CONFIG["target_icd_map"]),
+        evidence=os.path.expandvars(PHEWAS_CONFIG["icd_evidence"]),
+        summary=os.path.expandvars(PHEWAS_CONFIG["phenotype_summary"]),
+        survival_base=os.path.expandvars(PHEWAS_CONFIG["survival_base"]),
+        covariates=cfg_path("covariates"),
+    output:
+        os.path.expandvars(PHEWAS_CONFIG["landmark_survival_output"])
+    params:
+        prs_col=PHEWAS_CONFIG.get("prs_col", "PRSFNN_out_final_Z"),
+        min_code_count=PHEWAS_CONFIG.get("min_code_count", 1),
+        pc_cols=",".join(PHEWAS_CONFIG["pc_cols"]),
+        landmarks=PHEWAS_CONFIG.get("survival_landmarks", "40,50,60"),
+        phenotypes=PHEWAS_CONFIG.get("survival_landmark_phenotypes", ""),
+    log:
+        "logs/landmark_survival_phewas.log"
+    shell:
+        """
+        python workflow/scripts/run_landmark_survival_phewas.py \
+          --scores {input.score} \
+          --target-map {input.target_map} \
+          --evidence {input.evidence} \
+          --phenotype-summary {input.summary} \
+          --survival-base {input.survival_base} \
+          --covariates {input.covariates} \
+          --prs-col {params.prs_col} \
+          --pc-cols {params.pc_cols} \
+          --min-code-count {params.min_code_count} \
+          --landmarks {params.landmarks} \
+          --phenotypes {params.phenotypes} \
+          --out {output} \
+          > {log} 2>&1
+        """
+
+
+rule phewas_prs_tail_age:
+    input:
+        score=cfg_path("final_score"),
+        phenotypes=os.path.expandvars(PHEWAS_CONFIG["phenotypes"]),
+        summary=os.path.expandvars(PHEWAS_CONFIG["phenotype_summary"]),
+        covariates=cfg_path("covariates"),
+        survival_base=os.path.expandvars(PHEWAS_CONFIG["survival_base"]),
+    output:
+        tail=os.path.expandvars(PHEWAS_CONFIG["tail_output"]),
+        age=os.path.expandvars(PHEWAS_CONFIG["age_interaction_output"]),
+    params:
+        prs_col=PHEWAS_CONFIG.get("prs_col", "PRSFNN_out_final_Z"),
+        age_cols=",".join(PHEWAS_CONFIG["age_cols"]),
+        pc_cols=",".join(PHEWAS_CONFIG["pc_cols"]),
+        quantiles=PHEWAS_CONFIG.get("prs_tail_quantiles", "0.90,0.95,0.99"),
+    log:
+        "logs/phewas_prs_tail_age.log"
+    shell:
+        """
+        python workflow/scripts/run_prs_tail_age_phewas.py \
+          --scores {input.score} \
+          --phenotypes {input.phenotypes} \
+          --phenotype-summary {input.summary} \
+          --covariates {input.covariates} \
+          --survival-base {input.survival_base} \
+          --prs-col {params.prs_col} \
+          --age-cols {params.age_cols} \
+          --pc-cols {params.pc_cols} \
+          --quantiles {params.quantiles} \
+          --tail-out {output.tail} \
+          --age-out {output.age} \
+          > {log} 2>&1
+        """
+
+
+rule phewas_supplementary_sensitivities:
+    input:
+        score=cfg_path("final_score"),
+        phenotypes=os.path.expandvars(PHEWAS_CONFIG["phenotypes"]),
+        summary=os.path.expandvars(PHEWAS_CONFIG["phenotype_summary"]),
+        targets=os.path.expandvars(PHEWAS_CONFIG["targets"]),
+        target_map=os.path.expandvars(PHEWAS_CONFIG["target_icd_map"]),
+        evidence=os.path.expandvars(PHEWAS_CONFIG["icd_evidence"]),
+        denominator=os.path.expandvars(PHEWAS_CONFIG["ehr_denominator"]),
+        survival_base=os.path.expandvars(PHEWAS_CONFIG["survival_base"]),
+        covariates=cfg_path("covariates"),
+    output:
+        logistic=os.path.expandvars(PHEWAS_CONFIG["supplementary_logistic_covariate_output"]),
+        min2=os.path.expandvars(PHEWAS_CONFIG["supplementary_min_code_count2_output"]),
+        survival=os.path.expandvars(PHEWAS_CONFIG["supplementary_survival_sensitivity_output"]),
+        decile=os.path.expandvars(PHEWAS_CONFIG["supplementary_decile_risk_output"]),
+    params:
+        out_dir=os.path.expandvars(PHEWAS_CONFIG["supplementary_dir"]),
+        prs_col=PHEWAS_CONFIG.get("prs_col", "PRSFNN_out_final_Z"),
+        age_cols=",".join(PHEWAS_CONFIG["age_cols"]),
+        pc_cols=",".join(PHEWAS_CONFIG["pc_cols"]),
+        min_code_count=PHEWAS_CONFIG.get("min_code_count", 1),
+    log:
+        "logs/phewas_supplementary_sensitivities.log"
+    shell:
+        """
+        python workflow/scripts/run_phewas_supplementary_sensitivities.py \
+          --scores {input.score} \
+          --phenotypes {input.phenotypes} \
+          --phenotype-summary {input.summary} \
+          --targets {input.targets} \
+          --target-map {input.target_map} \
+          --evidence {input.evidence} \
+          --denominator {input.denominator} \
+          --survival-base {input.survival_base} \
+          --covariates {input.covariates} \
+          --prs-col {params.prs_col} \
+          --age-cols {params.age_cols} \
+          --pc-cols {params.pc_cols} \
+          --min-code-count {params.min_code_count} \
+          --out-dir {params.out_dir} \
+          > {log} 2>&1
+        """
+
+
+rule phewas_second_wave_sensitivities:
+    input:
+        score=cfg_path("final_score"),
+        phenotypes=os.path.expandvars(PHEWAS_CONFIG["phenotypes"]),
+        summary=os.path.expandvars(PHEWAS_CONFIG["phenotype_summary"]),
+        target_map=os.path.expandvars(PHEWAS_CONFIG["target_icd_map"]),
+        evidence=os.path.expandvars(PHEWAS_CONFIG["icd_evidence"]),
+        survival_base=os.path.expandvars(PHEWAS_CONFIG["survival_base"]),
+        covariates=cfg_path("covariates"),
+    output:
+        utilization=os.path.expandvars(PHEWAS_CONFIG["second_wave_ehr_utilization_output"]),
+        sex=os.path.expandvars(PHEWAS_CONFIG["second_wave_sex_stratified_output"]),
+        outlier=os.path.expandvars(PHEWAS_CONFIG["second_wave_prs_outlier_output"]),
+        decile_ci=os.path.expandvars(PHEWAS_CONFIG["second_wave_decile_ci_output"]),
+        prior_cancer=os.path.expandvars(PHEWAS_CONFIG["second_wave_prior_cancer_output"]),
+    params:
+        out_dir=os.path.expandvars(PHEWAS_CONFIG["supplementary_dir"]),
+        prs_col=PHEWAS_CONFIG.get("prs_col", "PRSFNN_out_final_Z"),
+        age_cols=",".join(PHEWAS_CONFIG["age_cols"]),
+        pc_cols=",".join(PHEWAS_CONFIG["pc_cols"]),
+        min_code_count=PHEWAS_CONFIG.get("min_code_count", 1),
+    log:
+        "logs/phewas_second_wave_sensitivities.log"
+    shell:
+        """
+        python workflow/scripts/run_phewas_second_wave_sensitivities.py \
+          --scores {input.score} \
+          --phenotypes {input.phenotypes} \
+          --phenotype-summary {input.summary} \
+          --target-map {input.target_map} \
+          --evidence {input.evidence} \
+          --survival-base {input.survival_base} \
+          --covariates {input.covariates} \
+          --prs-col {params.prs_col} \
+          --age-cols {params.age_cols} \
+          --pc-cols {params.pc_cols} \
+          --min-code-count {params.min_code_count} \
+          --out-dir {params.out_dir} \
+          > {log} 2>&1
+        """
+
+
+rule somatic_burden_phewas:
+    input:
+        exposure=os.path.expandvars(PHEWAS_CONFIG["somatic_burden"]),
+        phenotypes=os.path.expandvars(PHEWAS_CONFIG["phenotypes"]),
+        summary=os.path.expandvars(PHEWAS_CONFIG["phenotype_summary"]),
+        covariates=cfg_path("covariates"),
+        target_map=os.path.expandvars(PHEWAS_CONFIG["target_icd_map"]),
+        evidence=os.path.expandvars(PHEWAS_CONFIG["icd_evidence"]),
+        survival_base=os.path.expandvars(PHEWAS_CONFIG["survival_base"]),
+        age_at_sequencing=os.path.expandvars(PHEWAS_CONFIG["age_at_sequencing"]),
+    output:
+        logistic=os.path.expandvars(PHEWAS_CONFIG["somatic_burden_logistic_output"]),
+        survival=os.path.expandvars(PHEWAS_CONFIG["somatic_burden_post_draw_survival_output"]),
+    params:
+        exposure_col=PHEWAS_CONFIG.get("somatic_burden_col", "V3"),
+        min_code_count=PHEWAS_CONFIG.get("min_code_count", 1),
+        age_cols=",".join(PHEWAS_CONFIG["age_cols"]),
+        pc_cols=",".join(PHEWAS_CONFIG["pc_cols"]),
+    log:
+        "logs/somatic_burden_phewas.log"
+    shell:
+        """
+        python workflow/scripts/run_somatic_burden_phewas.py \
+          --exposure {input.exposure} \
+          --exposure-col {params.exposure_col} \
+          --phenotypes {input.phenotypes} \
+          --phenotype-summary {input.summary} \
+          --covariates {input.covariates} \
+          --target-map {input.target_map} \
+          --evidence {input.evidence} \
+          --survival-base {input.survival_base} \
+          --age-at-sequencing {input.age_at_sequencing} \
+          --min-code-count {params.min_code_count} \
+          --age-cols {params.age_cols} \
+          --pc-cols {params.pc_cols} \
+          --logistic-out {output.logistic} \
+          --survival-out {output.survival} \
+          > {log} 2>&1
+        """
