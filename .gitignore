@@ -9,6 +9,7 @@ data/
 *.png
 *.pdf
 *.md
+!workflow/README.md
 *.log
 *.sscore
 *.sscore.vars
