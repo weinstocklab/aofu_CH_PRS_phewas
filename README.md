@@ -1,10 +1,6 @@
 # aofu_CH_PRS_phewas
 
-Analysis scripts and workflow components for PheWAS studies involving clonal hematopoiesis (CH) and polygenic risk scores (PRS).
-
-## Scientific context
-
-This repository supports hypothesis-driven analyses of relationships between CH-related exposures and broad phenome outcomes, including effect-modification and risk-stratification analyses using PRS. The workflow is intended for reproducible, research-focused PheWAS analyses in controlled-access biomedical data settings.
+This repository supports hypothesis-driven analyses of relationships between clonal hematopoiesis (CH) exposures and broad phenome outcomes, including effect-modification and risk-stratification analyses using polygenic risk scores (PRS). The workflow is intended for reproducible, research-focused PheWAS analyses in controlled-access biomedical data settings.
 
 ## Repository structure
 
